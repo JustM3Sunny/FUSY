@@ -4,6 +4,8 @@ FUSY is a monorepo for an AI-assisted engineering CLI with provider routing, pol
 
 ## Install
 
+Requires Node.js 22+ (for built-in `node:sqlite` support).
+
 ```bash
 corepack enable
 pnpm install
@@ -54,7 +56,7 @@ pnpm --filter @fusy/cli dev run "pnpm lint" --trace true
 ## Troubleshooting
 
 - **`pnpm` bootstrap errors behind restricted network**: pre-install pnpm and dependencies in your environment/cache.
-- **SQLite errors**: ensure Node.js >=18 with `node:sqlite` support.
+- **SQLite errors**: ensure Node.js >=22 with `node:sqlite` support.
 - **Provider auth errors**: verify env keys and shell scope.
 
 ## Documentation
