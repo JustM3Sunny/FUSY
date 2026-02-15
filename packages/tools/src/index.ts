@@ -470,7 +470,8 @@ export const DEFAULT_TOOL_REGISTRY: Record<string, ToolDefinition> = {
   updateFile: {
     name: "updateFile",
     description: "Overwrite file using provided content",
-    execute: async (args, context) => updateFile(toLocalPath(context.cwd, args.path), async () => String(args.content ?? ""))
+    execute: async (args, context) =>
+      updateFile(toLocalPath(context.cwd, args.path), async () => String(args.content ?? ""))
   },
   deleteFile: {
     name: "deleteFile",
