@@ -19,6 +19,32 @@ describe("policy engine", () => {
       "Command requires approval"
     );
   });
+
+  it("blocks shell chaining operators by default", async () => {
+    await expect(runCommand("echo hi && echo bye")).rejects.toThrow("blocked shell meta operators");
+  });
+
+  it("blocks command substitution bypasses by default", async () => {
+    await expect(runCommand("echo $(rm -rf /tmp/nope)", { denyList: ["rm"] })).rejects.toThrow(
+      "blocked shell meta operators"
+    );
+  });
+
+  it("applies deny policy to all segments when strict policy enables shell operators", async () => {
+    await expect(
+      runCommand("echo hi && rm -rf /tmp/nope", {
+        denyList: ["rm"],
+        strictPolicy: { allowMetaOperators: true }
+      })
+    ).rejects.toThrow("Command denied by policy: rm");
+  });
+
+  it("supports allow-listed argv execution without shell", async () => {
+    await expect(runCommand("echo hello", { allowList: ["echo"] })).resolves.toEqual({
+      stdout: "hello",
+      stderr: ""
+    });
+  });
 });
 
 describe("diff application", () => {
