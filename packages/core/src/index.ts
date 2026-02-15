@@ -34,6 +34,67 @@ export interface RoutePlan {
   readonly fallback: readonly LLMProvider[];
 }
 
+export const WORKFLOW_STATES = [
+  "INTENT_PARSE",
+  "PLAN",
+  "TOOL_SELECT",
+  "TOOL_EXECUTE",
+  "OBSERVE",
+  "PATCH",
+  "VERIFY",
+  "SUMMARIZE"
+] as const;
+
+export type WorkflowState = (typeof WORKFLOW_STATES)[number];
+
+export interface WorkflowContext {
+  intent?: string;
+  plan?: string;
+  selectedTools?: string[];
+  toolResults?: string[];
+  observations?: string;
+  patch?: string;
+  verification?: {
+    success: boolean;
+    details: string;
+  };
+  summary?: string;
+  [key: string]: unknown;
+}
+
+export interface WorkflowCheckpoint {
+  state: WorkflowState;
+  context: WorkflowContext;
+  reason: "manual" | "verify_failed" | "interrupted";
+  timestamp: number;
+}
+
+
+export interface ToolCallRequest {
+  name: string;
+  args: Record<string, unknown>;
+}
+
+export interface ToolCallContext {
+  cwd: string;
+  policy?: {
+    allowList?: readonly string[];
+    denyList?: readonly string[];
+    requireApproval?: boolean;
+    approved?: boolean;
+  };
+}
+
+export type ToolInvoker = (request: ToolCallRequest, context: ToolCallContext) => Promise<unknown>;
+
+export interface WorkflowToolTrace {
+  state: WorkflowState;
+  toolName: string;
+  args: Record<string, unknown>;
+  result: unknown;
+  timestamp: number;
+}
+
 const isCapabilityMatch = (
   provider: LLMProvider,
   requiredCapabilities?: Partial<LLMCapabilities>
@@ -179,5 +240,101 @@ export class ProviderRouter {
     const head = prompt.slice(0, Math.floor(maxLength * 0.6));
     const tail = prompt.slice(-Math.floor(maxLength * 0.4));
     return `${head}\n...[context trimmed for retry]...\n${tail}`;
+  }
+}
+
+const NEXT_STATE: Record<WorkflowState, WorkflowState | null> = {
+  INTENT_PARSE: "PLAN",
+  PLAN: "TOOL_SELECT",
+  TOOL_SELECT: "TOOL_EXECUTE",
+  TOOL_EXECUTE: "OBSERVE",
+  OBSERVE: "PATCH",
+  PATCH: "VERIFY",
+  VERIFY: "SUMMARIZE",
+  SUMMARIZE: null
+};
+
+export class WorkflowStateMachine {
+  private currentState: WorkflowState = "INTENT_PARSE";
+  private readonly history: WorkflowState[] = ["INTENT_PARSE"];
+  private readonly checkpoints: WorkflowCheckpoint[] = [];
+  private readonly toolTraces: WorkflowToolTrace[] = [];
+
+  constructor(private readonly context: WorkflowContext = {}) {}
+
+  get state(): WorkflowState {
+    return this.currentState;
+  }
+
+  get snapshot(): WorkflowContext {
+    return { ...this.context };
+  }
+
+  get checkpointHistory(): readonly WorkflowCheckpoint[] {
+    return this.checkpoints;
+  }
+
+  get traceHistory(): readonly WorkflowToolTrace[] {
+    return this.toolTraces;
+  }
+
+  advance(partial: WorkflowContext = {}): WorkflowState {
+    Object.assign(this.context, partial);
+
+    if (this.currentState === "VERIFY" && this.context.verification?.success === false) {
+      this.createCheckpoint("verify_failed");
+      return this.rollbackTo("PATCH");
+    }
+
+    const next = NEXT_STATE[this.currentState];
+    if (next === null) {
+      return this.currentState;
+    }
+
+    this.currentState = next;
+    this.history.push(next);
+    return this.currentState;
+  }
+
+
+  async runTool(request: ToolCallRequest, context: ToolCallContext, invoker: ToolInvoker): Promise<unknown> {
+    const result = await invoker(request, context);
+    const trace: WorkflowToolTrace = {
+      state: this.currentState,
+      toolName: request.name,
+      args: request.args,
+      result,
+      timestamp: Date.now()
+    };
+
+    this.toolTraces.push(trace);
+    return result;
+  }
+
+  checkpoint(reason: WorkflowCheckpoint["reason"] = "manual"): WorkflowCheckpoint {
+    return this.createCheckpoint(reason);
+  }
+
+  rollbackTo(state: WorkflowState): WorkflowState {
+    this.currentState = state;
+    this.history.push(state);
+    return this.currentState;
+  }
+
+  rollbackForInterruption(): WorkflowState {
+    this.createCheckpoint("interrupted");
+    return this.rollbackTo("OBSERVE");
+  }
+
+  private createCheckpoint(reason: WorkflowCheckpoint["reason"]): WorkflowCheckpoint {
+    const checkpoint: WorkflowCheckpoint = {
+      state: this.currentState,
+      context: structuredClone(this.context),
+      reason,
+      timestamp: Date.now()
+    };
+
+    this.checkpoints.push(checkpoint);
+    return checkpoint;
   }
 }
