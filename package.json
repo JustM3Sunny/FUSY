@@ -13,7 +13,10 @@
     "test": "pnpm -r --parallel test",
     "lint": "pnpm -r --parallel lint",
     "typecheck": "pnpm -r --parallel typecheck",
-    "format": "prettier --check ."
+    "format": "prettier --check .",
+    "changeset": "changeset",
+    "release:version": "changeset version",
+    "release:publish": "changeset publish"
   },
   "devDependencies": {
     "@types/node": "^22.10.1",
@@ -24,6 +27,7 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.18.1",
-    "vitest": "^2.1.8"
+    "vitest": "^2.1.8",
+    "@changesets/cli": "^2.27.11"
   }
 }
