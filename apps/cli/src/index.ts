@@ -1,209 +1,218 @@
-import { promises as fs } from "node:fs";
-import { createInterface } from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
+import { spawn } from "node:child_process";
+import path from "node:path";
 
-import { type WorkflowCheckpoint, WorkflowStateMachine, createInitialState } from "@fusy/core";
-import { loadConfig } from "@fusy/config";
-import { DEFAULT_TOOL_REGISTRY, executeTool } from "@fusy/tools";
-import { logInfo } from "@fusy/telemetry";
+import { ContextPacker, HybridRetriever, RepositoryIndexer } from "@fusy/core";
+import { SqliteMemoryStore } from "@fusy/memory";
 
-const CHECKPOINT_FILE = ".fusy-session-checkpoint.json";
+const printHelp = (): void => {
+  console.log(`FUSY CLI
 
-const normalizeYesNo = (value: string): boolean => {
-  const normalized = value.trim().toLowerCase();
-  return normalized === "y" || normalized === "yes";
+Commands:
+  pair [intent...]               Start a new paired session.
+  run <command...>               Execute a shell command and capture output in session memory.
+  resume <sessionId>             Resume an existing session.
+  sessions                       List sessions.
+  memory list [projectId]        List project memory entries.
+  memory clear [projectId]       Clear all memory or memory for one project.
+`);
 };
 
-const isDestructiveAction = (text: string): boolean => {
-  const destructivePatterns = ["rm ", "--force", "git reset", "truncate", "delete", "docker push"];
-  return destructivePatterns.some((pattern) => text.toLowerCase().includes(pattern));
-};
-
-const persistCheckpoint = async (checkpoint: WorkflowCheckpoint): Promise<void> => {
-  await fs.writeFile(CHECKPOINT_FILE, JSON.stringify(checkpoint, null, 2), "utf8");
-};
-
-const parseJsonArgs = (raw: string): Record<string, unknown> => {
-  if (!raw.trim()) {
-    return {};
+const parseFlag = (argv: string[], name: string): string | undefined => {
+  const index = argv.findIndex((arg) => arg === `--${name}`);
+  if (index < 0) {
+    return undefined;
   }
 
-  const parsed = JSON.parse(raw) as unknown;
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("Tool args must be a JSON object");
+  return argv[index + 1];
+};
+
+const runCommand = async (command: string, cwd: string): Promise<{ code: number; stdout: string; stderr: string }> =>
+  new Promise((resolve, reject) => {
+    const child = spawn(command, {
+      cwd,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      stdout += text;
+      process.stdout.write(text);
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      stderr += text;
+      process.stderr.write(text);
+    });
+
+    child.on("error", reject);
+    child.on("close", (code) => {
+      resolve({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() });
+    });
+  });
+
+const getMemoryStore = (): SqliteMemoryStore =>
+  new SqliteMemoryStore({
+    dbPath: path.join(process.cwd(), ".fusy", "memory.sqlite")
+  });
+
+const createSessionId = (): string => `session-${Date.now()}`;
+
+const handlePair = async (argv: string[]): Promise<void> => {
+  const memory = getMemoryStore();
+  const sessionId = parseFlag(argv, "session") ?? createSessionId();
+  const intent = argv.filter((arg) => !arg.startsWith("--")).join(" ").trim() || "Pairing task";
+
+  memory.upsertSession({ id: sessionId, intent, status: "active" });
+
+  const indexer = new RepositoryIndexer();
+  const index = await indexer.index(process.cwd());
+  const retriever = new HybridRetriever();
+  const retrieval = await retriever.search(intent, index.files.slice(0, 30).map((file) => ({
+    id: file.path,
+    text: `${file.path} ${file.extension}`,
+    path: file.path
+  })));
+
+  const packer = new ContextPacker();
+  const packed = packer.pack(
+    retrieval.map((item, i) => ({
+      id: item.candidate.id,
+      text: item.candidate.text,
+      priority: Math.max(1, 10 - i)
+    })),
+    { tokenBudget: 800, reservedTokens: 200 }
+  );
+
+  memory.setProjectMemory(process.cwd(), `session:${sessionId}:context`, JSON.stringify(packed), true);
+
+  console.log(`Started pairing session ${sessionId}`);
+  console.log(`Indexed files: ${index.files.length}, symbols: ${index.symbols.length}`);
+  memory.close();
+};
+
+const handleRun = async (argv: string[]): Promise<void> => {
+  const memory = getMemoryStore();
+  const sessionId = parseFlag(argv, "session") ?? createSessionId();
+  const command = argv.filter((arg) => !arg.startsWith("--")).join(" ").trim();
+
+  if (!command) {
+    throw new Error("run requires a shell command");
   }
 
-  return parsed as Record<string, unknown>;
+  memory.upsertSession({ id: sessionId, status: "active", plan: `run ${command}` });
+  const result = await runCommand(command, process.cwd());
+
+  memory.setProjectMemory(
+    process.cwd(),
+    `session:${sessionId}:last-run`,
+    JSON.stringify({ command, ...result }),
+    true
+  );
+
+  memory.upsertSession({
+    id: sessionId,
+    status: result.code === 0 ? "completed" : "paused",
+    summary: result.code === 0 ? `Command succeeded: ${command}` : `Command failed (${result.code}): ${command}`
+  });
+
+  memory.close();
+  if (result.code !== 0) {
+    process.exit(result.code);
+  }
+};
+
+const handleResume = (sessionId?: string): void => {
+  if (!sessionId) {
+    throw new Error("resume requires a sessionId");
+  }
+
+  const memory = getMemoryStore();
+  const session = memory.getSession(sessionId);
+  if (!session) {
+    throw new Error(`Session not found: ${sessionId}`);
+  }
+
+  memory.upsertSession({ id: sessionId, status: "active" });
+  console.log(`Resumed ${sessionId}`);
+  console.log(JSON.stringify(session, null, 2));
+  memory.close();
+};
+
+const handleSessions = (): void => {
+  const memory = getMemoryStore();
+  const sessions = memory.listSessions();
+  console.table(
+    sessions.map((session) => ({
+      id: session.id,
+      status: session.status,
+      intent: session.intent ?? "",
+      updatedAt: new Date(session.updatedAt).toISOString()
+    }))
+  );
+  memory.close();
+};
+
+const handleMemory = (argv: string[]): void => {
+  const subcommand = argv[0];
+  const projectId = argv[1] ?? process.cwd();
+  const memory = getMemoryStore();
+
+  if (subcommand === "list") {
+    const rows = memory.listProjectMemory(projectId);
+    console.table(rows);
+  } else if (subcommand === "clear") {
+    const scope = argv[1];
+    memory.clearMemory(scope);
+    console.log(scope ? `Cleared memory for ${scope}` : "Cleared all memory");
+  } else {
+    throw new Error("memory requires subcommand: list|clear");
+  }
+
+  memory.close();
 };
 
 const main = async (): Promise<void> => {
-  const config = loadConfig();
-  const state = createInitialState("default");
-  const machine = new WorkflowStateMachine();
+  const [command, ...rest] = process.argv.slice(2);
 
-  logInfo(`Starting CLI in ${config.nodeEnv} mode`);
-
-  const rl = createInterface({ input, output });
-
-  const handleInterrupt = async (): Promise<void> => {
-    machine.rollbackForInterruption();
-    const checkpoint = machine.checkpointHistory.at(-1);
-    if (checkpoint) {
-      await persistCheckpoint(checkpoint);
-    }
-
-    output.write("Session interrupted. Rolled back and stored checkpoint.\n");
-    rl.close();
-    process.exit(130);
-  };
-
-  process.once("SIGINT", () => {
-    void handleInterrupt();
-  });
-
-  const intent = await rl.question("What should I do? ");
-  machine.advance({ intent });
-
-  const plan = await rl.question("Plan for this task: ");
-  machine.advance({ plan });
-
-  output.write(`Available tools (${Object.keys(DEFAULT_TOOL_REGISTRY).length}):\n`);
-  output.write(`${Object.keys(DEFAULT_TOOL_REGISTRY).join(", ")}\n`);
-
-  const selectedTools = await rl.question("Tools to run (comma-separated): ");
-  const selectedToolNames = selectedTools
-    .split(",")
-    .map((tool) => tool.trim())
-    .filter(Boolean);
-  machine.advance({ selectedTools: selectedToolNames });
-
-  const toolResults: string[] = [];
-  for (const toolName of selectedToolNames) {
-    if (!DEFAULT_TOOL_REGISTRY[toolName]) {
-      output.write(`Skipping unknown tool: ${toolName}\n`);
-      continue;
-    }
-
-    const argsRaw = await rl.question(`JSON args for ${toolName}: `);
-    let args: Record<string, unknown>;
-
-    try {
-      args = parseJsonArgs(argsRaw);
-    } catch (error) {
-      output.write(`Invalid args for ${toolName}: ${error instanceof Error ? error.message : String(error)}\n`);
-      continue;
-    }
-
-    if (toolName === "runCommand") {
-      const command = String(args.command ?? "");
-      if (!command) {
-        output.write("runCommand requires {\"command\":\"...\"}\n");
-        continue;
-      }
-
-      if (isDestructiveAction(command)) {
-        const destructiveApproval = await rl.question(
-          "Destructive action detected. Approve execution? (y/N): "
-        );
-        if (!normalizeYesNo(destructiveApproval)) {
-          output.write("Destructive action rejected by user.\n");
-          continue;
-        }
-      }
-
-      const commandApproval = await rl.question("Execute command now? (y/N): ");
-      if (!normalizeYesNo(commandApproval)) {
-        output.write("Command execution cancelled.\n");
-        continue;
-      }
-    }
-
-    try {
-      const result = await machine.runTool(
-        { name: toolName, args },
-        {
-          cwd: process.cwd(),
-          policy: {
-            requireApproval: true,
-            approved: true,
-            denyList: ["shutdown", "reboot", "mkfs", "dd"]
-          }
-        },
-        (request, context) => executeTool(request.name, request.args, context)
-      );
-
-      const rendered = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-      output.write(`Tool ${toolName} result:\n${rendered}\n`);
-      toolResults.push(toolName);
-    } catch (error) {
-      output.write(`Tool ${toolName} failed: ${error instanceof Error ? error.message : String(error)}\n`);
-    }
+  if (!command || command === "--help" || command === "-h") {
+    printHelp();
+    return;
   }
 
-  machine.advance({ toolResults });
-
-  const observations = await rl.question("Observations: ");
-  machine.advance({ observations });
-
-  const patch = await rl.question("Patch preview text (optional):\n");
-  if (patch.trim()) {
-    output.write("--- Patch Preview ---\n");
-    output.write(`${patch}\n`);
-    output.write("--- End Preview ---\n");
-
-    const patchDecision = await rl.question("Apply patch, reject patch, or skip? (apply/reject/skip): ");
-    if (patchDecision.trim().toLowerCase() === "apply") {
-      try {
-        await executeTool(
-          "gitApplyPatch",
-          { patch },
-          {
-            cwd: process.cwd(),
-            policy: {
-              requireApproval: true,
-              approved: true,
-              denyList: ["shutdown", "reboot", "mkfs", "dd"]
-            }
-          }
-        );
-        output.write("Patch applied successfully.\n");
-      } catch (error) {
-        output.write(`Patch apply failed: ${error instanceof Error ? error.message : String(error)}\n`);
-      }
-    } else if (patchDecision.trim().toLowerCase() === "reject") {
-      output.write("Patch rejected by user.\n");
-    } else {
-      output.write("Patch skipped.\n");
-    }
-  }
-  machine.advance({ patch });
-
-  const verificationAnswer = await rl.question("Did verification pass? (y/N): ");
-  const verificationSuccess = normalizeYesNo(verificationAnswer);
-  machine.advance({
-    verification: {
-      success: verificationSuccess,
-      details: verificationSuccess ? "Verification passed" : "Verification failed"
-    }
-  });
-
-  if (!verificationSuccess) {
-    const checkpoint = machine.checkpointHistory.at(-1);
-    if (checkpoint) {
-      await persistCheckpoint(checkpoint);
-    }
-
-    output.write("Verification failed. Rolled back to PATCH and checkpoint created.\n");
+  if (command === "pair") {
+    await handlePair(rest);
+    return;
   }
 
-  const summary = await rl.question("Summary: ");
-  machine.advance({ summary });
+  if (command === "run") {
+    await handleRun(rest);
+    return;
+  }
 
-  output.write(`Received: ${intent}\n`);
-  output.write(`Current state: ${state.status}\n`);
-  output.write(`Workflow state: ${machine.state}\n`);
+  if (command === "resume") {
+    handleResume(rest[0]);
+    return;
+  }
 
-  rl.close();
+  if (command === "sessions") {
+    handleSessions();
+    return;
+  }
+
+  if (command === "memory") {
+    handleMemory(rest);
+    return;
+  }
+
+  throw new Error(`Unknown command: ${command}`);
 };
 
-void main();
+void main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});
