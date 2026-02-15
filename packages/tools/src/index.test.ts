@@ -1,9 +1,10 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { gitApplyPatch, runCommand, searchFiles } from "./index.js";
 import { execSync } from "node:child_process";
 
 import { gitApplyPatch, runCommand } from "./index.js";
@@ -67,5 +68,42 @@ describe("diff application", () => {
     await gitApplyPatch(patch, repo);
     const content = await readFile(target, "utf8");
     expect(content).toBe("line-b\n");
+  });
+});
+
+describe("searchFiles", () => {
+  it("ignores common build directories by default", async () => {
+    const repo = await mkdtemp(path.join(os.tmpdir(), "fusy-search-"));
+    await writeFile(path.join(repo, "src.ts"), "needle\n", "utf8");
+    await mkdir(path.join(repo, "node_modules", "pkg"), { recursive: true });
+    await writeFile(path.join(repo, "node_modules", "pkg", "index.ts"), "needle\n", "utf8");
+
+    const matches = await searchFiles(repo, "needle", [".ts"]);
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.file).toBe(path.join(repo, "src.ts"));
+  });
+
+  it("respects max file size, file limit and match limit", async () => {
+    const repo = await mkdtemp(path.join(os.tmpdir(), "fusy-search-limits-"));
+    await writeFile(path.join(repo, "a.ts"), "needle\nneedle\n", "utf8");
+    await writeFile(path.join(repo, "b.ts"), "needle\n", "utf8");
+    await writeFile(path.join(repo, "large.ts"), `${"x".repeat(64)}needle`, "utf8");
+
+    const matches = await searchFiles(repo, "needle", [".ts"], {
+      maxFileSizeBytes: 20,
+      maxFiles: 1,
+      maxMatches: 1
+    });
+
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.text).toContain("needle");
+  });
+
+  it("stops immediately when timeout budget is exhausted", async () => {
+    const repo = await mkdtemp(path.join(os.tmpdir(), "fusy-search-timeout-"));
+    await writeFile(path.join(repo, "one.ts"), "needle\n", "utf8");
+
+    const matches = await searchFiles(repo, "needle", [".ts"], { timeoutMs: 0 });
+    expect(matches).toEqual([]);
   });
 });

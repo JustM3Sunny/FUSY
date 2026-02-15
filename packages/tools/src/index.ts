@@ -11,6 +11,14 @@ export interface SearchMatch {
   text: string;
 }
 
+export interface SearchFilesOptions {
+  readonly ignoreDirs?: readonly string[];
+  readonly maxFileSizeBytes?: number;
+  readonly maxMatches?: number;
+  readonly maxFiles?: number;
+  readonly timeoutMs?: number;
+}
+
 export interface RunCommandPolicy {
   readonly allowList?: readonly string[];
   readonly denyList?: readonly string[];
@@ -377,18 +385,48 @@ export const writeJson = async (filePath: string, value: unknown): Promise<void>
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
 };
 
+const DEFAULT_SEARCH_EXTENSIONS = [".ts", ".tsx", ".js", ".json", ".md"];
+// Keep aligned with DEFAULT_IGNORE_DIRS in packages/core/src/context.ts.
+const DEFAULT_SEARCH_IGNORE_DIRS = [".git", "node_modules", "dist", "build", ".next", ".turbo"];
+const DEFAULT_MAX_FILE_SIZE_BYTES = 256 * 1024;
+const DEFAULT_MAX_MATCHES = 200;
+const DEFAULT_MAX_FILES = 2_000;
+const DEFAULT_TIMEOUT_MS = 5_000;
+
 export const searchFiles = async (
   directory: string,
   query: string,
-  extensions: readonly string[] = [".ts", ".tsx", ".js", ".json", ".md"]
+  extensions: readonly string[] = DEFAULT_SEARCH_EXTENSIONS,
+  options: SearchFilesOptions = {}
 ): Promise<SearchMatch[]> => {
   const matches: SearchMatch[] = [];
+  const ignoreDirs = new Set([...DEFAULT_SEARCH_IGNORE_DIRS, ...(options.ignoreDirs ?? [])]);
+  const maxFileSizeBytes = Math.max(1, options.maxFileSizeBytes ?? DEFAULT_MAX_FILE_SIZE_BYTES);
+  const maxMatches = Math.max(1, options.maxMatches ?? DEFAULT_MAX_MATCHES);
+  const maxFiles = Math.max(1, options.maxFiles ?? DEFAULT_MAX_FILES);
+  const timeoutMs = Math.max(0, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const deadline = Date.now() + timeoutMs;
+  let scannedFiles = 0;
+
+  const shouldStop = (): boolean => scannedFiles >= maxFiles || matches.length >= maxMatches || Date.now() >= deadline;
 
   const walk = async (dir: string): Promise<void> => {
+    if (shouldStop()) {
+      return;
+    }
+
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
+      if (shouldStop()) {
+        return;
+      }
+
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
+        if (ignoreDirs.has(entry.name)) {
+          continue;
+        }
+
         await walk(fullPath);
         continue;
       }
@@ -397,10 +435,16 @@ export const searchFiles = async (
         continue;
       }
 
+      scannedFiles += 1;
+      const stat = await fs.stat(fullPath);
+      if (stat.size > maxFileSizeBytes) {
+        continue;
+      }
+
       const content = await fs.readFile(fullPath, "utf8");
       const lines = content.split(/\r?\n/u);
       lines.forEach((lineText, index) => {
-        if (lineText.includes(query)) {
+        if (matches.length < maxMatches && lineText.includes(query)) {
           matches.push({ file: fullPath, line: index + 1, text: lineText.trim() });
         }
       });
@@ -746,7 +790,18 @@ export const DEFAULT_TOOL_REGISTRY: Record<string, ToolDefinition> = {
       searchFiles(
         toLocalPath(context.cwd, args.path),
         String(args.query ?? ""),
-        Array.isArray(args.extensions) ? args.extensions.map((item) => String(item)) : undefined
+        Array.isArray(args.extensions) ? args.extensions.map((item) => String(item)) : undefined,
+        {
+          ignoreDirs: Array.isArray(args.ignoreDirs) ? args.ignoreDirs.map((item) => String(item)) : undefined,
+          maxFileSizeBytes:
+            typeof args.maxFileSizeBytes === "number" && Number.isFinite(args.maxFileSizeBytes)
+              ? args.maxFileSizeBytes
+              : undefined,
+          maxMatches:
+            typeof args.maxMatches === "number" && Number.isFinite(args.maxMatches) ? args.maxMatches : undefined,
+          maxFiles: typeof args.maxFiles === "number" && Number.isFinite(args.maxFiles) ? args.maxFiles : undefined,
+          timeoutMs: typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) ? args.timeoutMs : undefined
+        }
       )
   },
   replaceString: {
