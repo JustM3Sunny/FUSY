@@ -1,3 +1,5 @@
+import Ajv, { type ErrorObject, type ValidateFunction } from "ajv";
+
 export type ProviderName = "gemini" | "groq";
 
 export type LLMErrorCode =
@@ -15,6 +17,7 @@ export class ProviderError extends Error {
   readonly status?: number;
   readonly retryable: boolean;
   readonly cause?: unknown;
+  readonly validationErrors?: readonly ValidationErrorDetail[];
 
   constructor(params: {
     provider: ProviderName;
@@ -23,6 +26,7 @@ export class ProviderError extends Error {
     status?: number;
     retryable?: boolean;
     cause?: unknown;
+    validationErrors?: readonly ValidationErrorDetail[];
   }) {
     super(params.message);
     this.name = "ProviderError";
@@ -31,7 +35,14 @@ export class ProviderError extends Error {
     this.status = params.status;
     this.retryable = params.retryable ?? false;
     this.cause = params.cause;
+    this.validationErrors = params.validationErrors;
   }
+}
+
+export interface ValidationErrorDetail {
+  readonly path: string;
+  readonly expected: string;
+  readonly received: unknown;
 }
 
 export interface LLMCapabilities {
@@ -71,6 +82,7 @@ export interface LLMStructuredOutputRequest {
   readonly prompt: string;
   readonly schema: Record<string, unknown>;
   readonly timeoutMs?: number;
+  readonly repairRetries?: number;
 }
 
 export interface LLMProvider {
@@ -87,6 +99,7 @@ export interface LLMProvider {
 }
 
 const DEFAULT_TIMEOUT_MS = 20_000;
+const ajv = new Ajv({ allErrors: true });
 
 const normalizeProviderError = (
   provider: ProviderName,
@@ -183,6 +196,65 @@ const parseJsonText = (value: string): Record<string, unknown> => {
   return JSON.parse(body) as Record<string, unknown>;
 };
 
+const formatExpectedValue = (error: ErrorObject): string => {
+  switch (error.keyword) {
+    case "type":
+      return `type ${(error.params as { type?: string }).type ?? "unknown"}`;
+    case "required":
+      return `required property ${(error.params as { missingProperty?: string }).missingProperty ?? "unknown"}`;
+    case "enum":
+      return `one of ${(error.params as { allowedValues?: unknown[] }).allowedValues?.join(", ") ?? "allowed values"}`;
+    case "additionalProperties":
+      return `no additional property ${(error.params as { additionalProperty?: string }).additionalProperty ?? "unknown"}`;
+    default:
+      return error.message ?? error.keyword;
+  }
+};
+
+const readInstanceValue = (data: unknown, instancePath: string): unknown => {
+  if (!instancePath || instancePath === "/") {
+    return data;
+  }
+
+  const segments = instancePath
+    .slice(1)
+    .split("/")
+    .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"));
+
+  let current: unknown = data;
+  for (const segment of segments) {
+    if (Array.isArray(current)) {
+      current = current[Number(segment)];
+    } else if (current !== null && typeof current === "object") {
+      current = (current as Record<string, unknown>)[segment];
+    } else {
+      return undefined;
+    }
+  }
+
+  return current;
+};
+
+const getInstancePath = (error: ErrorObject): string => {
+  const withInstancePath = error as ErrorObject & { instancePath?: string; dataPath?: string };
+  return withInstancePath.instancePath ?? withInstancePath.dataPath ?? "";
+};
+
+const normalizeInstancePath = (instancePath: string): string =>
+  instancePath
+    ? `$.${instancePath.replace(/^\/?/, "").replace(/^\./, "").replace(/[/.]/g, ".")}`
+    : "$";
+
+const toValidationErrors = (validator: ValidateFunction, payload: unknown): ValidationErrorDetail[] =>
+  (validator.errors ?? []).map((error) => {
+    const instancePath = getInstancePath(error);
+    return {
+      path: normalizeInstancePath(instancePath),
+      expected: formatExpectedValue(error),
+      received: readInstanceValue(payload, instancePath.replace(/^\./, "/").replace(/\./g, "/"))
+    };
+  });
+
 abstract class BaseHttpProvider implements LLMProvider {
   abstract readonly name: ProviderName;
   abstract readonly model: string;
@@ -242,16 +314,74 @@ abstract class BaseHttpProvider implements LLMProvider {
 
   async structuredOutput<T>(request: LLMStructuredOutputRequest): Promise<T> {
     const schema = JSON.stringify(request.schema);
-    const response = await this.generate(
+    const validator = ajv.compile(request.schema);
+    const repairRetries = request.repairRetries ?? 1;
+    let response = await this.generate(
       `${request.prompt}\n\nReturn a strict JSON object matching this schema: ${schema}`,
       { timeoutMs: request.timeoutMs }
     );
 
-    try {
-      return parseJsonText(response) as T;
-    } catch (error) {
-      throw normalizeProviderError(this.name, error);
+    for (let attempt = 0; attempt <= repairRetries; attempt += 1) {
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = parseJsonText(response);
+      } catch {
+        if (attempt === repairRetries) {
+          throw new ProviderError({
+            provider: this.name,
+            code: "INVALID_REQUEST",
+            message: `${this.name} produced malformed JSON for structured output`,
+            retryable: false,
+            validationErrors: [{ path: "$", expected: "valid JSON object", received: response }]
+          });
+        }
+
+        response = await this.generate(
+          [
+            "Repair this malformed JSON to match the schema.",
+            `Schema: ${schema}`,
+            `Malformed JSON: ${response}`,
+            "Return corrected JSON only. No prose, no markdown."
+          ].join("\n"),
+          { timeoutMs: request.timeoutMs, temperature: 0 }
+        );
+        continue;
+      }
+
+      if (validator(parsed)) {
+        return parsed as T;
+      }
+
+      const validationErrors = toValidationErrors(validator, parsed);
+      if (attempt === repairRetries) {
+        throw new ProviderError({
+          provider: this.name,
+          code: "INVALID_REQUEST",
+          message: `${this.name} produced schema-incompatible structured output`,
+          retryable: false,
+          validationErrors,
+          cause: parsed
+        });
+      }
+
+      response = await this.generate(
+        [
+          "Repair this JSON so it satisfies the schema.",
+          `Schema: ${schema}`,
+          `JSON: ${JSON.stringify(parsed)}`,
+          `Validation errors: ${JSON.stringify(validationErrors)}`,
+          "Return corrected JSON only. No prose, no markdown."
+        ].join("\n"),
+        { timeoutMs: request.timeoutMs, temperature: 0 }
+      );
     }
+
+    throw new ProviderError({
+      provider: this.name,
+      code: "UNKNOWN",
+      message: `${this.name} failed to produce structured output`,
+      retryable: false
+    });
   }
 
   abstract generate(prompt: string, options?: LLMGenerateOptions): Promise<string>;
