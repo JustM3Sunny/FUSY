@@ -18,13 +18,48 @@ Commands:
 `);
 };
 
-const parseFlag = (argv: string[], name: string): string | undefined => {
+type ParsedCliArgs = {
+  flags: Record<string, string>;
+  positionalArgs: string[];
+};
+
+const getRawFlagValue = (argv: string[], name: string): string | undefined => {
   const index = argv.findIndex((arg) => arg === `--${name}`);
   if (index < 0) {
     return undefined;
   }
 
   return argv[index + 1];
+};
+
+const parseCliArgs = (argv: string[], knownFlags: string[]): ParsedCliArgs => {
+  const knownFlagSet = new Set(knownFlags);
+  const flags: Record<string, string> = {};
+  const positionalArgs: string[] = [];
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (!arg.startsWith("--")) {
+      positionalArgs.push(arg);
+      continue;
+    }
+
+    const name = arg.slice(2);
+    if (!knownFlagSet.has(name)) {
+      positionalArgs.push(arg);
+      continue;
+    }
+
+    const value = argv[i + 1];
+    if (!value || value.startsWith("--")) {
+      throw new Error(`Missing value for --${name}. Example: --${name} <value>`);
+    }
+
+    flags[name] = value;
+    i += 1;
+  }
+
+  return { flags, positionalArgs };
 };
 
 const runCommand = async (command: string, cwd: string): Promise<{ code: number; stdout: string; stderr: string }> =>
@@ -68,9 +103,10 @@ const traceEvent = (events: TraceEvent[], requestId: string, event: string, payl
 };
 
 const handlePair = async (argv: string[], logger: Logger, traces: TraceEvent[]): Promise<void> => {
+  const parsedArgs = parseCliArgs(argv, ["session"]);
   const memory = getMemoryStore();
-  const sessionId = parseFlag(argv, "session") ?? createSessionId();
-  const intent = argv.filter((arg) => !arg.startsWith("--")).join(" ").trim() || "Pairing task";
+  const sessionId = parsedArgs.flags.session ?? createSessionId();
+  const intent = parsedArgs.positionalArgs.join(" ").trim() || "Pairing task";
 
   traceEvent(traces, logger.getRequestId(), "pair.start", { sessionId, intent });
   memory.upsertSession({ id: sessionId, intent, status: "active" });
@@ -97,9 +133,10 @@ const handlePair = async (argv: string[], logger: Logger, traces: TraceEvent[]):
 };
 
 const handleRun = async (argv: string[], logger: Logger, traces: TraceEvent[]): Promise<number> => {
+  const parsedArgs = parseCliArgs(argv, ["session"]);
   const memory = getMemoryStore();
-  const sessionId = parseFlag(argv, "session") ?? createSessionId();
-  const command = argv.filter((arg) => !arg.startsWith("--")).join(" ").trim();
+  const sessionId = parsedArgs.flags.session ?? createSessionId();
+  const command = parsedArgs.positionalArgs.join(" ").trim();
 
   if (!command) {
     throw new Error("run requires a shell command");
@@ -200,7 +237,7 @@ export const executeCli = async (argv: string[]): Promise<number> => {
     throw new Error(`Unknown command: ${command}`);
   }
 
-  if (parseFlag(rest, "trace") === "true") {
+  if (getRawFlagValue(rest, "trace") === "true") {
     const tracePath = await exportDebugTrace(traces);
     logger.info("trace exported", { tracePath });
   }
