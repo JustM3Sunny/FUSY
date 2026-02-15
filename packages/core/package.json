@@ -6,7 +6,8 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "dependencies": {
-    "@fusy/shared": "workspace:*"
+    "@fusy/shared": "workspace:*",
+    "@fusy/providers": "workspace:*"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
