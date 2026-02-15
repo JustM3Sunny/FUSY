@@ -338,3 +338,5 @@ export class WorkflowStateMachine {
     return checkpoint;
   }
 }
+
+export * from "./context.js";
