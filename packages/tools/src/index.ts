@@ -1,4 +1,4 @@
-import { exec as execCallback } from "node:child_process";
+import { exec as execCallback, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -16,6 +16,9 @@ export interface RunCommandPolicy {
   readonly denyList?: readonly string[];
   readonly requireApproval?: boolean;
   readonly approved?: boolean;
+  readonly strictPolicy?: {
+    readonly allowMetaOperators?: boolean;
+  };
 }
 
 export interface ToolExecutionContext {
@@ -33,6 +36,194 @@ const parseCommand = (command: string): string => {
   const [bin] = command.trim().split(/\s+/u);
   return bin ?? "";
 };
+
+const META_OPERATORS = ["&&", "||", ";", "|", "`", "$("] as const;
+
+const splitByMetaOperators = (command: string): string[] => {
+  const segments: string[] = [];
+  let current = "";
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let escapeNext = false;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const ch = command[index] ?? "";
+    const next = command[index + 1] ?? "";
+
+    if (escapeNext) {
+      current += ch;
+      escapeNext = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      current += ch;
+      escapeNext = true;
+      continue;
+    }
+
+    if (ch === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote;
+      current += ch;
+      continue;
+    }
+
+    if (ch === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      current += ch;
+      continue;
+    }
+
+    if (inSingleQuote || inDoubleQuote) {
+      current += ch;
+      continue;
+    }
+
+    if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) {
+      if (current.trim()) {
+        segments.push(current.trim());
+      }
+      current = "";
+      index += 1;
+      continue;
+    }
+
+    if (ch === ";" || ch === "|") {
+      if (current.trim()) {
+        segments.push(current.trim());
+      }
+      current = "";
+      continue;
+    }
+
+    current += ch;
+  }
+
+  if (current.trim()) {
+    segments.push(current.trim());
+  }
+
+  return segments;
+};
+
+const parseArgv = (command: string): string[] => {
+  const argv: string[] = [];
+  let token = "";
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let escapeNext = false;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const ch = command[index] ?? "";
+
+    if (escapeNext) {
+      token += ch;
+      escapeNext = false;
+      continue;
+    }
+
+    if (ch === "\\" && !inSingleQuote) {
+      escapeNext = true;
+      continue;
+    }
+
+    if (ch === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote;
+      continue;
+    }
+
+    if (ch === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote && /\s/u.test(ch)) {
+      if (token.length > 0) {
+        argv.push(token);
+        token = "";
+      }
+      continue;
+    }
+
+    token += ch;
+  }
+
+  if (inSingleQuote || inDoubleQuote || escapeNext) {
+    throw new Error(`Invalid command syntax: ${command}`);
+  }
+
+  if (token.length > 0) {
+    argv.push(token);
+  }
+
+  return argv;
+};
+
+const parseSubcommands = (command: string): string[] => {
+  const subcommands: string[] = [];
+  const backtickPattern = /`([^`]+)`/gu;
+  const dollarPattern = /\$\(([^)]+)\)/gu;
+
+  for (const match of command.matchAll(backtickPattern)) {
+    const content = match[1]?.trim();
+    if (content) {
+      subcommands.push(content);
+    }
+  }
+
+  for (const match of command.matchAll(dollarPattern)) {
+    const content = match[1]?.trim();
+    if (content) {
+      subcommands.push(content);
+    }
+  }
+
+  return subcommands;
+};
+
+const extractExecutableBins = (command: string): string[] => {
+  const bins = splitByMetaOperators(command)
+    .map(parseCommand)
+    .filter((bin): bin is string => bin.length > 0);
+
+  for (const subcommand of parseSubcommands(command)) {
+    bins.push(...extractExecutableBins(subcommand));
+  }
+
+  return bins;
+};
+
+const hasMetaOperators = (command: string): boolean => META_OPERATORS.some((operator) => command.includes(operator));
+
+const spawnCommand = async (
+  file: string,
+  args: readonly string[],
+  cwd: string
+): Promise<{ stdout: string; stderr: string }> =>
+  new Promise((resolve, reject) => {
+    const child = spawn(file, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", reject);
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ stdout: stdout.trimEnd(), stderr: stderr.trimEnd() });
+        return;
+      }
+
+      reject(new Error(stderr.trim() || `Command failed with exit code ${code}`));
+    });
+  });
 
 const isCommandAllowed = (bin: string, policy: RunCommandPolicy): boolean => {
   const denied = policy.denyList ?? ["rm", "shutdown", "reboot", "mkfs", "dd"];
@@ -54,20 +245,35 @@ const runCommandInternal = async (
   policy: RunCommandPolicy = {},
   cwd: string = process.cwd()
 ): Promise<{ stdout: string; stderr: string }> => {
-  const bin = parseCommand(command);
+  const allowMetaOperators = policy.strictPolicy?.allowMetaOperators === true;
 
-  if (!isCommandAllowed(bin, policy)) {
-    throw new Error(`Command denied by policy: ${bin}`);
+  if (hasMetaOperators(command) && !allowMetaOperators) {
+    throw new Error(`Command contains blocked shell meta operators: ${command}`);
+  }
+
+  const bins = extractExecutableBins(command);
+  for (const bin of bins) {
+    if (!isCommandAllowed(bin, policy)) {
+      throw new Error(`Command denied by policy: ${bin}`);
+    }
   }
 
   if (policy.requireApproval && !policy.approved) {
     throw new Error(`Command requires approval: ${command}`);
   }
 
-  const { stdout, stderr } = await exec(command, {
-    cwd,
-    maxBuffer: 4 * 1024 * 1024
-  });
+  if (!allowMetaOperators) {
+    const argv = parseArgv(command);
+    const [file, ...args] = argv;
+
+    if (!file) {
+      throw new Error("Command must not be empty");
+    }
+
+    return spawnCommand(file, args, cwd);
+  }
+
+  const { stdout, stderr } = await exec(command, { cwd, maxBuffer: 4 * 1024 * 1024 });
 
   return { stdout: stdout.trimEnd(), stderr: stderr.trimEnd() };
 };
