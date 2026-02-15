@@ -237,7 +237,7 @@ const isCommandAllowed = (bin: string, policy: RunCommandPolicy): boolean => {
   const denied = policy.denyList ?? ["rm", "shutdown", "reboot", "mkfs", "dd"];
   const allowed = policy.allowList;
 
-  if (denied.includes(bin)) {
+  if (denied.includes(bin) && !policy.approved) {
     return false;
   }
 

@@ -1,9 +1,10 @@
-import { spawn } from "node:child_process";
 import path from "node:path";
+import readline from "node:readline/promises";
 
 import { ContextPacker, HybridRetriever, RepositoryIndexer } from "@fusy/core";
 import { SqliteMemoryStore } from "@fusy/memory";
 import { Logger, exportDebugTrace, type TraceEvent } from "@fusy/telemetry";
+import { executeTool, type RunCommandPolicy, type ToolExecutionContext } from "@fusy/tools";
 
 export const printHelp = (): void => {
   console.log(`FUSY CLI
@@ -11,6 +12,9 @@ export const printHelp = (): void => {
 Commands:
   pair [intent...]               Start a new paired session.
   run <command...>               Execute a shell command and capture output in session memory.
+    --require-approval <bool>    Require confirmation before command execution.
+    --allow-list <csv>           Comma-separated list of allowed binaries.
+    --deny-list <csv>            Comma-separated list of denied/destructive binaries.
   resume <sessionId>             Resume an existing session.
   sessions                       List sessions.
   memory list [projectId]        List project memory entries.
@@ -21,6 +25,15 @@ Commands:
 type ParsedCliArgs = {
   flags: Record<string, string>;
   positionalArgs: string[];
+};
+
+type CommandAuditDecision = "auto-approved" | "approved" | "denied";
+
+type CommandExecutionResult = {
+  success: boolean;
+  stdout: string;
+  stderr: string;
+  error?: string;
 };
 
 const getRawFlagValue = (argv: string[], name: string): string | undefined => {
@@ -62,34 +75,111 @@ const parseCliArgs = (argv: string[], knownFlags: string[]): ParsedCliArgs => {
   return { flags, positionalArgs };
 };
 
-const runCommand = async (command: string, cwd: string): Promise<{ code: number; stdout: string; stderr: string }> =>
-  new Promise((resolve, reject) => {
-    const child = spawn(command, {
-      cwd,
-      shell: true,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
+const parseBooleanFlag = (input: string | undefined): boolean | undefined => {
+  if (input === undefined) {
+    return undefined;
+  }
 
-    let stdout = "";
-    let stderr = "";
+  const normalized = input.trim().toLowerCase();
+  if (["true", "1", "yes", "y"].includes(normalized)) {
+    return true;
+  }
 
-    child.stdout.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-      stdout += text;
-      process.stdout.write(text);
-    });
+  if (["false", "0", "no", "n"].includes(normalized)) {
+    return false;
+  }
 
-    child.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-      stderr += text;
-      process.stderr.write(text);
-    });
+  throw new Error(`Invalid boolean value: ${input}`);
+};
 
-    child.on("error", reject);
-    child.on("close", (code) => {
-      resolve({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() });
-    });
-  });
+const parseCsvFlag = (input: string | undefined): string[] | undefined => {
+  if (!input) {
+    return undefined;
+  }
+
+  const values = input
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+
+  return values.length > 0 ? values : undefined;
+};
+
+const parseCsvEnv = (name: string): string[] | undefined => parseCsvFlag(process.env[name]);
+
+const shouldPromptForApproval = (errorMessage: string): boolean =>
+  errorMessage.includes("Command denied by policy") || errorMessage.includes("Command requires approval");
+
+const requestApproval = async (command: string): Promise<boolean> => {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    return false;
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(`Command blocked by policy. Approve execution?\n> ${command}\nType 'yes' to approve: `);
+    return answer.trim().toLowerCase() === "yes";
+  } finally {
+    rl.close();
+  }
+};
+
+const resolveRunCommandPolicy = (flags: Record<string, string>): RunCommandPolicy => ({
+  requireApproval: parseBooleanFlag(flags["require-approval"]) ?? parseBooleanFlag(process.env.FUSY_REQUIRE_APPROVAL) ?? false,
+  allowList: parseCsvFlag(flags["allow-list"]) ?? parseCsvEnv("FUSY_ALLOW_LIST"),
+  denyList: parseCsvFlag(flags["deny-list"]) ?? parseCsvEnv("FUSY_DENY_LIST")
+});
+
+const executeWithPolicy = async (
+  command: string,
+  context: ToolExecutionContext
+): Promise<{ decision: CommandAuditDecision; result: CommandExecutionResult }> => {
+  try {
+    const response = await executeTool("runCommand", { command }, context);
+    const output = response as { stdout?: string; stderr?: string };
+    return {
+      decision: "auto-approved",
+      result: { success: true, stdout: output.stdout ?? "", stderr: output.stderr ?? "" }
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+
+    if (!shouldPromptForApproval(message)) {
+      return {
+        decision: "auto-approved",
+        result: { success: false, stdout: "", stderr: message, error: message }
+      };
+    }
+
+    const approved = await requestApproval(command);
+    if (!approved) {
+      return {
+        decision: "denied",
+        result: { success: false, stdout: "", stderr: message, error: "Command denied by user" }
+      };
+    }
+
+    const approvedContext: ToolExecutionContext = {
+      ...context,
+      policy: { ...(context.policy ?? {}), approved: true }
+    };
+
+    try {
+      const response = await executeTool("runCommand", { command }, approvedContext);
+      const output = response as { stdout?: string; stderr?: string };
+      return {
+        decision: "approved",
+        result: { success: true, stdout: output.stdout ?? "", stderr: output.stderr ?? "" }
+      };
+    } catch (approvedError: unknown) {
+      const approvedMessage = approvedError instanceof Error ? approvedError.message : String(approvedError);
+      return {
+        decision: "approved",
+        result: { success: false, stdout: "", stderr: approvedMessage, error: approvedMessage }
+      };
+    }
+  }
+};
 
 const getMemoryStore = (): SqliteMemoryStore =>
   new SqliteMemoryStore({
@@ -133,7 +223,7 @@ const handlePair = async (argv: string[], logger: Logger, traces: TraceEvent[]):
 };
 
 const handleRun = async (argv: string[], logger: Logger, traces: TraceEvent[]): Promise<number> => {
-  const parsedArgs = parseCliArgs(argv, ["session"]);
+  const parsedArgs = parseCliArgs(argv, ["session", "require-approval", "allow-list", "deny-list"]);
   const memory = getMemoryStore();
   const sessionId = parsedArgs.flags.session ?? createSessionId();
   const command = parsedArgs.positionalArgs.join(" ").trim();
@@ -143,20 +233,44 @@ const handleRun = async (argv: string[], logger: Logger, traces: TraceEvent[]): 
   }
 
   memory.upsertSession({ id: sessionId, status: "active", plan: `run ${command}` });
-  const result = await runCommand(command, process.cwd());
-  traceEvent(traces, logger.getRequestId(), "run.command", { sessionId, command, code: result.code });
+  const policy = resolveRunCommandPolicy(parsedArgs.flags);
+  const { decision, result } = await executeWithPolicy(command, { cwd: process.cwd(), policy });
 
-  memory.setProjectMemory(process.cwd(), `session:${sessionId}:last-run`, JSON.stringify({ command, ...result }), true);
+  traceEvent(traces, logger.getRequestId(), "run.command", {
+    sessionId,
+    command,
+    decision,
+    success: result.success
+  });
+
+  const decisionRecord = {
+    command,
+    decision,
+    policy,
+    timestamp: new Date().toISOString()
+  };
+
+  const resultRecord = {
+    command,
+    success: result.success,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    error: result.error,
+    timestamp: new Date().toISOString()
+  };
+
+  memory.setProjectMemory(process.cwd(), `session:${sessionId}:last-decision`, JSON.stringify(decisionRecord), true);
+  memory.setProjectMemory(process.cwd(), `session:${sessionId}:last-run`, JSON.stringify(resultRecord), true);
 
   memory.upsertSession({
     id: sessionId,
-    status: result.code === 0 ? "completed" : "paused",
-    summary: result.code === 0 ? `Command succeeded: ${command}` : `Command failed (${result.code}): ${command}`
+    status: result.success ? "completed" : "paused",
+    summary: result.success ? `Command succeeded: ${command}` : `Command failed: ${command}`
   });
 
-  logger.info("run completed", { sessionId, command, code: result.code });
+  logger.info("run completed", { sessionId, command, decision, success: result.success });
   memory.close();
-  return result.code;
+  return result.success ? 0 : 1;
 };
 
 const handleResume = (sessionId: string | undefined, logger: Logger): void => {

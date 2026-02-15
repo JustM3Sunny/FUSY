@@ -7,6 +7,8 @@ import { describe, expect, it } from "vitest";
 import { gitApplyPatch, runCommand, searchFiles } from "./index.js";
 import { execSync } from "node:child_process";
 
+import { gitApplyPatch, runCommand } from "./index.js";
+
 describe("policy engine", () => {
   it("blocks denied commands", async () => {
     await expect(runCommand("rm -rf /tmp/nope", { denyList: ["rm"] })).rejects.toThrow(
@@ -37,6 +39,13 @@ describe("policy engine", () => {
         strictPolicy: { allowMetaOperators: true }
       })
     ).rejects.toThrow("Command denied by policy: rm");
+  });
+
+  it("allows denied commands when explicitly approved", async () => {
+    await expect(runCommand("echo hi", { denyList: ["echo"], approved: true })).resolves.toEqual({
+      stdout: "hi",
+      stderr: ""
+    });
   });
 
   it("supports allow-listed argv execution without shell", async () => {

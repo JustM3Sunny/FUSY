@@ -51,7 +51,7 @@ describe("cli integration", () => {
   it("parses run session flag and keeps only positional command", async () => {
     const temp = await useTempProject();
 
-    await expect(executeCli(["run", "--session", "s1", "pnpm", "test"]))
+    await expect(executeCli(["run", "--session", "s1", "echo", "ok"]))
       .resolves
       .toBe(0);
 
@@ -59,7 +59,25 @@ describe("cli integration", () => {
     const session = memory.getSession("s1");
     memory.close();
 
-    expect(session?.plan).toBe("run pnpm test");
+    expect(session?.plan).toBe("run echo ok");
+  });
+
+  it("records approval decision when command requires approval in non-interactive mode", async () => {
+    const temp = await useTempProject();
+
+    await expect(executeCli(["run", "--session", "s2", "--require-approval", "true", "echo", "ok"]))
+      .resolves
+      .toBe(1);
+
+    const memory = new SqliteMemoryStore({ dbPath: path.join(temp, ".fusy", "memory.sqlite") });
+    const projectMemory = memory.listProjectMemory(temp);
+    memory.close();
+
+    const decision = projectMemory.find((record) => record.key === "session:s2:last-decision")?.value ?? "";
+    const run = projectMemory.find((record) => record.key === "session:s2:last-run")?.value ?? "";
+
+    expect(decision).toContain('"decision":"denied"');
+    expect(run).toContain('"success":false');
   });
 
   it("reports missing run session value with a user-friendly error", async () => {
