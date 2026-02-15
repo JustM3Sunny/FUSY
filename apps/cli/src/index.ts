@@ -3,8 +3,9 @@ import path from "node:path";
 
 import { ContextPacker, HybridRetriever, RepositoryIndexer } from "@fusy/core";
 import { SqliteMemoryStore } from "@fusy/memory";
+import { Logger, exportDebugTrace, type TraceEvent } from "@fusy/telemetry";
 
-const printHelp = (): void => {
+export const printHelp = (): void => {
   console.log(`FUSY CLI
 
 Commands:
@@ -62,40 +63,40 @@ const getMemoryStore = (): SqliteMemoryStore =>
 
 const createSessionId = (): string => `session-${Date.now()}`;
 
-const handlePair = async (argv: string[]): Promise<void> => {
+const traceEvent = (events: TraceEvent[], requestId: string, event: string, payload?: Record<string, unknown>): void => {
+  events.push({ ts: new Date().toISOString(), requestId, event, payload });
+};
+
+const handlePair = async (argv: string[], logger: Logger, traces: TraceEvent[]): Promise<void> => {
   const memory = getMemoryStore();
   const sessionId = parseFlag(argv, "session") ?? createSessionId();
   const intent = argv.filter((arg) => !arg.startsWith("--")).join(" ").trim() || "Pairing task";
 
+  traceEvent(traces, logger.getRequestId(), "pair.start", { sessionId, intent });
   memory.upsertSession({ id: sessionId, intent, status: "active" });
 
   const indexer = new RepositoryIndexer();
   const index = await indexer.index(process.cwd());
   const retriever = new HybridRetriever();
-  const retrieval = await retriever.search(intent, index.files.slice(0, 30).map((file) => ({
-    id: file.path,
-    text: `${file.path} ${file.extension}`,
-    path: file.path
-  })));
+  const retrieval = await retriever.search(
+    intent,
+    index.files.slice(0, 30).map((file) => ({ id: file.path, text: `${file.path} ${file.extension}`, path: file.path }))
+  );
 
   const packer = new ContextPacker();
   const packed = packer.pack(
-    retrieval.map((item, i) => ({
-      id: item.candidate.id,
-      text: item.candidate.text,
-      priority: Math.max(1, 10 - i)
-    })),
+    retrieval.map((item, i) => ({ id: item.candidate.id, text: item.candidate.text, priority: Math.max(1, 10 - i) })),
     { tokenBudget: 800, reservedTokens: 200 }
   );
 
   memory.setProjectMemory(process.cwd(), `session:${sessionId}:context`, JSON.stringify(packed), true);
 
-  console.log(`Started pairing session ${sessionId}`);
-  console.log(`Indexed files: ${index.files.length}, symbols: ${index.symbols.length}`);
+  logger.info("Started pairing session", { sessionId, indexedFiles: index.files.length, symbols: index.symbols.length });
+  logger.usage("context-packed", { tokensIn: packed.usedTokens, tokensOut: 0, costUsd: 0 }, { dropped: packed.droppedChunkIds.length });
   memory.close();
 };
 
-const handleRun = async (argv: string[]): Promise<void> => {
+const handleRun = async (argv: string[], logger: Logger, traces: TraceEvent[]): Promise<number> => {
   const memory = getMemoryStore();
   const sessionId = parseFlag(argv, "session") ?? createSessionId();
   const command = argv.filter((arg) => !arg.startsWith("--")).join(" ").trim();
@@ -106,13 +107,9 @@ const handleRun = async (argv: string[]): Promise<void> => {
 
   memory.upsertSession({ id: sessionId, status: "active", plan: `run ${command}` });
   const result = await runCommand(command, process.cwd());
+  traceEvent(traces, logger.getRequestId(), "run.command", { sessionId, command, code: result.code });
 
-  memory.setProjectMemory(
-    process.cwd(),
-    `session:${sessionId}:last-run`,
-    JSON.stringify({ command, ...result }),
-    true
-  );
+  memory.setProjectMemory(process.cwd(), `session:${sessionId}:last-run`, JSON.stringify({ command, ...result }), true);
 
   memory.upsertSession({
     id: sessionId,
@@ -120,13 +117,12 @@ const handleRun = async (argv: string[]): Promise<void> => {
     summary: result.code === 0 ? `Command succeeded: ${command}` : `Command failed (${result.code}): ${command}`
   });
 
+  logger.info("run completed", { sessionId, command, code: result.code });
   memory.close();
-  if (result.code !== 0) {
-    process.exit(result.code);
-  }
+  return result.code;
 };
 
-const handleResume = (sessionId?: string): void => {
+const handleResume = (sessionId: string | undefined, logger: Logger): void => {
   if (!sessionId) {
     throw new Error("resume requires a sessionId");
   }
@@ -138,7 +134,7 @@ const handleResume = (sessionId?: string): void => {
   }
 
   memory.upsertSession({ id: sessionId, status: "active" });
-  console.log(`Resumed ${sessionId}`);
+  logger.info("session resumed", { sessionId });
   console.log(JSON.stringify(session, null, 2));
   memory.close();
 };
@@ -176,43 +172,51 @@ const handleMemory = (argv: string[]): void => {
   memory.close();
 };
 
-const main = async (): Promise<void> => {
-  const [command, ...rest] = process.argv.slice(2);
+export const executeCli = async (argv: string[]): Promise<number> => {
+  const [command, ...rest] = argv;
+  const logger = new Logger();
+  const traces: TraceEvent[] = [];
 
   if (!command || command === "--help" || command === "-h") {
     printHelp();
-    return;
+    return 0;
   }
 
   if (command === "pair") {
-    await handlePair(rest);
-    return;
-  }
-
-  if (command === "run") {
-    await handleRun(rest);
-    return;
-  }
-
-  if (command === "resume") {
-    handleResume(rest[0]);
-    return;
-  }
-
-  if (command === "sessions") {
+    await handlePair(rest, logger, traces);
+  } else if (command === "run") {
+    const code = await handleRun(rest, logger, traces);
+    if (code !== 0) {
+      await exportDebugTrace(traces);
+      return code;
+    }
+  } else if (command === "resume") {
+    handleResume(rest[0], logger);
+  } else if (command === "sessions") {
     handleSessions();
-    return;
-  }
-
-  if (command === "memory") {
+  } else if (command === "memory") {
     handleMemory(rest);
-    return;
+  } else {
+    throw new Error(`Unknown command: ${command}`);
   }
 
-  throw new Error(`Unknown command: ${command}`);
+  if (parseFlag(rest, "trace") === "true") {
+    const tracePath = await exportDebugTrace(traces);
+    logger.info("trace exported", { tracePath });
+  }
+
+  return 0;
 };
 
-void main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+const isMain = process.argv[1] && path.resolve(process.argv[1]).includes(`${path.sep}apps${path.sep}cli${path.sep}`);
+
+if (isMain) {
+  void executeCli(process.argv.slice(2)).then((code) => {
+    if (code !== 0) {
+      process.exit(code);
+    }
+  }).catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}
